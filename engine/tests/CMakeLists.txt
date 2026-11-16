@@ -723,6 +723,7 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
 
     llama_build_and_test(test-llama-archs.cpp)
     llama_test(test-llama-archs NAME test-kv-cache-grow ARGS --kv-grow -s 42)
+    llama_test(test-llama-archs NAME test-dsv41-engram-layouts ARGS --engram-layouts -s 42)
 endif()
 
 llama_build_and_test(test-chat-peg-parser.cpp peg-parser/simple-tokenize.cpp)
