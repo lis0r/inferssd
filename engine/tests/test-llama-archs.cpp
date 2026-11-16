@@ -11,6 +11,15 @@
 // TODO: replace with #include "llama-ext.h" in the future
 #include "../src/llama-arch.h"
 #include "../src/llama-model-saver.h"
+#include "../src/llama-model.h"
+
+#include <chrono>
+#include <filesystem>
+#include <fstream>
+#if !defined(_WIN32)
+#include <sys/mman.h>
+#include <unistd.h>
+#endif
 
 #include <algorithm>
 #include <array>
@@ -70,7 +79,7 @@ static void set_tensor_data(struct ggml_tensor * tensor, void * userdata) {
 }
 
 static void usage(char ** argv) {
-    printf("Usage: %s [-a/--arch arch] [-s/--seed seed] [-v/--verbose] [--kv-grow] [--engram-layouts]\n", argv[0]);
+    printf("Usage: %s [-a/--arch arch] [-s/--seed seed] [-v/--verbose] [--kv-grow] [--engram-layouts] [--engram-layouts-iq4]\n", argv[0]);
 }
 
 static std::vector<llama_token> get_tokens(const uint32_t n_tokens, const uint32_t n_vocab, const size_t seed){
@@ -870,10 +879,10 @@ static int test_kv_grow(const llm_arch target_arch, const size_t seed, const ggm
 // the product of engram_q and engram_k as engram_gate. The same weights in either layout give the same logits.
 struct dsv41_engram_layouts_data {
     size_t seed;
-    std::vector<uint8_t> table; // MXFP8 rows of every Engram layer, the first layer's first
+    ggml_type type = GGML_TYPE_MXFP8;
+    size_t row_bytes = DSV41_ENGRAM_KEY_LENGTH / 32 * 33;
+    std::vector<uint8_t> table; // quantized rows of every Engram layer, the first layer's first
 };
-
-static const size_t DSV41_ENGRAM_ROW_BYTES = DSV41_ENGRAM_KEY_LENGTH / 32 * 33; // MXFP8: 33 bytes for 32 values
 
 // rows of Engram layer e's table: its last bucket's end
 static uint64_t dsv41_engram_rows(size_t e) {
@@ -889,7 +898,7 @@ static void set_engram_layouts_data(struct ggml_tensor * tensor, void * userdata
     const auto & ud = *(const dsv41_engram_layouts_data *) userdata;
     const std::string name = tensor->name;
     if (name == "per_layer_token_embd.weight") {
-        GGML_ASSERT(tensor->type == GGML_TYPE_MXFP8 && ggml_nbytes(tensor) == ud.table.size());
+        GGML_ASSERT(tensor->type == ud.type && ggml_nbytes(tensor) == ud.table.size());
         ggml_backend_tensor_set(tensor, ud.table.data(), 0, ud.table.size());
         return;
     }
@@ -898,8 +907,8 @@ static void set_engram_layouts_data(struct ggml_tensor * tensor, void * userdata
         if (name == "blk." + std::to_string(DSV41_ENGRAM_LAYERS[e]) + ".engram_embd.weight") {
             // the layer's rows of the MXFP8 table, decoded
             std::vector<float> values(ggml_nelements(tensor));
-            ggml_get_type_traits(GGML_TYPE_MXFP8)->to_float(
-                ud.table.data() + first_row*DSV41_ENGRAM_ROW_BYTES, values.data(), (int64_t) values.size());
+            ggml_get_type_traits(ud.type)->to_float(
+                ud.table.data() + first_row*ud.row_bytes, values.data(), (int64_t) values.size());
             ggml_backend_tensor_set(tensor, values.data(), 0, ggml_nbytes(tensor));
             return;
         }
@@ -919,24 +928,170 @@ static void set_engram_layouts_data(struct ggml_tensor * tensor, void * userdata
     set_tensor_data_named(tensor, source, ud.seed);
 }
 
-static int test_engram_layouts(const size_t seed, const ggml_log_level log_level) {
+// A real six-shard GGUF, including an unnumbered Engram file linked as shard
+// six. On POSIX its table is padded to >8 GiB with sparse holes: opening it and
+// decoding must not read or allocate the whole table. The referenced rows contain
+// the exact quantized fixture bytes; padding is never used as model evidence.
+static void test_engram_file_layout(gguf_context * metadata, const llama_model & source,
+                                   const dsv41_engram_layouts_data & ud,
+                                   const std::vector<float> & expected) {
+    namespace fs = std::filesystem;
+    struct scratch {
+        fs::path path = fs::temp_directory_path() /
+            ("inferssd-engram-layout-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+        scratch() { fs::create_directory(path); }
+        ~scratch() { std::error_code error; fs::remove_all(path, error); }
+    } directory;
+    std::array<gguf_context_ptr, 6> shards;
+    for (auto & shard : shards) { shard.reset(gguf_init_empty()); }
+    gguf_set_kv(shards[0].get(), metadata);
+    size_t index = 0;
+    for (const auto & item : source.tensors_by_name) {
+        ggml_tensor tensor = *item.second;
+        std::string name = item.first;
+        const auto at = name.find(".engram_wkv.");
+        if (at != std::string::npos) {
+            name.replace(at, std::strlen(".engram_wkv."), ".engram_kv.");
+            ggml_set_name(&tensor, name.c_str()); // exercise the published alias too
+        }
+        const bool table = name == "per_layer_token_embd.weight";
+#if !defined(_WIN32)
+        if (table) {
+            tensor.ne[1] = int64_t((uint64_t(8) << 30) / ud.row_bytes + 1);
+            tensor.nb[2] = tensor.nb[3] = tensor.nb[1] * tensor.ne[1];
+        }
+#endif
+        gguf_add_tensor(shards[table ? 5 : 1 + index++ % 4].get(), &tensor);
+    }
+    size_t count = 0;
+    for (const auto & shard : shards) { count += gguf_get_n_tensors(shard.get()); }
+    std::array<fs::path, 6> paths;
+    for (size_t i = 0; i < shards.size(); ++i) {
+        auto * shard = shards[i].get();
+        gguf_set_val_u16(shard, "split.no", uint16_t(i));
+        gguf_set_val_u16(shard, "split.count", 6);
+        gguf_set_val_i32(shard, "split.tensors.count", int32_t(count));
+        paths[i] = directory.path / ("model-0000" + std::to_string(i + 1) + "-of-00006.gguf");
+        const auto target = i == 5 ? directory.path / "Engram-IQ4_NL.gguf" : paths[i];
+        if (!gguf_write_to_file(shard, target.string().c_str(), i == 5)) {
+            throw std::runtime_error("could not write Engram fixture shard");
+        }
+        if (i == 5) {
+            std::ofstream data(target, std::ios::binary | std::ios::app);
+            data.write(reinterpret_cast<const char *>(ud.table.data()), std::streamsize(ud.table.size()));
+            data.close();
+            if (!data) { throw std::runtime_error("could not write Engram fixture rows"); }
+            const auto header = gguf_get_meta_size(shard);
+            const auto bytes = uint64_t(gguf_get_tensor_size(shard, 0));
+            fs::resize_file(target, header + bytes);
+#if defined(_WIN32)
+            fs::create_hard_link(target, paths[i]);
+#else
+            fs::create_symlink(target.filename(), paths[i]);
+#endif
+        }
+    }
+    auto params = llama_model_default_params();
+    std::vector<ggml_backend_dev_t> devices = {ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU), nullptr};
+    params.devices = devices.data();
+    params.n_gpu_layers = 0;
+    params.progress_callback = silent_model_load_progress;
+    params.use_mmap = true;
+    llama_model_ptr model(llama_model_load_from_file(paths[0].string().c_str(), params));
+    if (!model) { throw std::runtime_error("could not mmap six-shard IQ4_NL fixture"); }
+    const auto * table = model->per_layer_tok_embd;
+    if (!table || table->type != GGML_TYPE_IQ4_NL ||
+            !ggml_backend_buffer_is_host(table->buffer) ||
+            model->layers[1].engram_embd != table || model->layers[3].engram_embd != table) {
+        throw std::runtime_error("shared Engram is not one host-mapped IQ4_NL table");
+    }
+    const auto resident = [&]() {
+#if defined(__linux__)
+        const size_t page = size_t(sysconf(_SC_PAGESIZE));
+        const auto address = reinterpret_cast<uintptr_t>(table->data);
+        const auto first = address / page * page;
+        const size_t length = ggml_nbytes(table) + address - first;
+        std::vector<unsigned char> pages((length + page - 1) / page);
+        if (mincore(reinterpret_cast<void *>(first), length, pages.data())) {
+            throw std::runtime_error("could not inspect Engram file-page residency");
+        }
+        size_t bytes = 0;
+        for (auto state : pages) { if (state & 1) { bytes += page; } }
+        if (bytes > (size_t(32) << 20)) {
+            throw std::runtime_error("sparse Engram mapping became resident beyond the 32 MiB fixture bound");
+        }
+        return int64_t(bytes);
+#else
+        return int64_t(-1); // unavailable, never report absent residency evidence as zero
+#endif
+    };
+    const int64_t before = resident();
+    auto context_params = llama_context_default_params();
+    context_params.n_ctx = 128;
+    context_params.n_ubatch = 64;
+    context_params.n_threads = context_params.n_threads_batch = 4;
+    llama_context_ptr context(llama_init_from_model(model.get(), context_params));
+    if (!context) { throw std::runtime_error("could not create file-backed Engram context"); }
+    const auto actual = get_logits(model.get(), context.get(), get_tokens(32,
+        llama_vocab_n_tokens(llama_model_get_vocab(model.get())), ud.seed));
+    if (actual != expected) { throw std::runtime_error("file-backed IQ4_NL logits differ from the reference layout"); }
+    const int64_t after = resident();
+    context.reset();
+    model.reset();
+    // These options must reject the lazy table rather than materialize or lock it.
+    for (int option = 0; option < 3; ++option) {
+        auto invalid = params;
+        if (option == 0) { invalid.use_mmap = false; }
+        if (option == 1) { invalid.check_tensors = true; }
+        if (option == 2) { invalid.use_mlock = true; }
+        llama_model_ptr rejected(llama_model_load_from_file(paths[0].string().c_str(), invalid));
+        if (rejected) { throw std::runtime_error("an eager Engram loading option was accepted"); }
+    }
+    const int64_t offsets_key = gguf_find_key(shards[0].get(), "deepseek41.ple.head_offsets");
+    const auto * offsets_data = static_cast<const uint64_t *>(gguf_get_arr_data(shards[0].get(), offsets_key));
+    const std::vector<uint64_t> original_offsets(offsets_data, offsets_data + gguf_get_arr_n(shards[0].get(), offsets_key));
+    for (const uint64_t bad_offset : {UINT64_MAX, uint64_t(gguf_get_tensor_size(shards[5].get(), 0) / ud.row_bytes)}) {
+        auto offsets = original_offsets;
+        offsets[0] = bad_offset;
+        gguf_set_arr_data(shards[0].get(), "deepseek41.ple.head_offsets", GGUF_TYPE_UINT64, offsets.data(), offsets.size());
+        if (!gguf_write_to_file(shards[0].get(), paths[0].string().c_str(), true)) {
+            throw std::runtime_error("could not write invalid bucket fixture");
+        }
+        llama_model_ptr rejected(llama_model_load_from_file(paths[0].string().c_str(), params));
+        if (rejected) { throw std::runtime_error("out-of-range Engram bucket was accepted"); }
+    }
+    printf("ENGRAM_FILE_PASS shards=6 type=iq4_nl bytes=%zu resident_before=%lld resident_after=%lld bitwise=1\n",
+           gguf_get_tensor_size(shards[5].get(), 0), (long long) before, (long long) after);
+}
+
+static int test_engram_layouts(const size_t seed, const ggml_log_level log_level,
+                               const ggml_type table_type = GGML_TYPE_MXFP8) {
     const llm_arch arch = LLM_ARCH_DEEPSEEK41;
     const LLM_KV kv(arch);
     const size_t n_cols = (DSV41_ENGRAM_NGRAM - 1) * DSV41_ENGRAM_HEADS;
 
     dsv41_engram_layouts_data ud;
     ud.seed = seed;
+    ud.type = table_type;
+    ud.row_bytes = ggml_row_size(table_type, DSV41_ENGRAM_KEY_LENGTH);
     uint64_t n_rows = 0;
     for (size_t e = 0; e < DSV41_ENGRAM_LAYERS.size(); ++e) {
         n_rows += dsv41_engram_rows(e);
     }
     std::mt19937 gen(seed);
-    ud.table.resize(n_rows*DSV41_ENGRAM_ROW_BYTES);
-    for (size_t i = 0; i < ud.table.size(); ++i) {
-        // E8M0 scales near 2^-6, E4M3 codes but the NaN ones
-        ud.table[i] = i % 33 == 0 ? uint8_t(116 + gen() % 8) : uint8_t(gen() % 256);
-        if (i % 33 != 0 && (ud.table[i] & 127) == 127) {
-            ud.table[i] ^= 1;
+    ud.table.resize(n_rows*ud.row_bytes);
+    if (table_type == GGML_TYPE_IQ4_NL) {
+        std::vector<float> values(n_rows*DSV41_ENGRAM_KEY_LENGTH);
+        std::normal_distribution<float> sample(0.0f, 0.06f);
+        for (auto & value : values) { value = sample(gen); }
+        ggml_quantize_init(table_type);
+        GGML_ASSERT(ggml_quantize_chunk(table_type, values.data(), ud.table.data(), 0, n_rows,
+                                       DSV41_ENGRAM_KEY_LENGTH, nullptr) == ud.table.size());
+    } else {
+        for (size_t i = 0; i < ud.table.size(); ++i) {
+            // E8M0 scales near 2^-6, E4M3 codes but the NaN ones
+            ud.table[i] = i % 33 == 0 ? uint8_t(116 + gen() % 8) : uint8_t(gen() % 256);
+            if (i % 33 != 0 && (ud.table[i] & 127) == 127) { ud.table[i] ^= 1; }
         }
     }
 
@@ -967,12 +1122,12 @@ static int test_engram_layouts(const size_t seed, const ggml_log_level log_level
         // the table's type: a model made from metadata alone takes each tensor's type from it
         ggml_tensor t;
         memset(&t, 0, sizeof(ggml_tensor));
-        t.type  = GGML_TYPE_MXFP8;
+        t.type  = table_type;
         t.ne[0] = DSV41_ENGRAM_KEY_LENGTH;
         t.ne[1] = (int64_t) n_rows;
         t.ne[2] = t.ne[3] = 1;
         t.nb[0] = ggml_type_size(t.type);
-        t.nb[1] = DSV41_ENGRAM_ROW_BYTES;
+        t.nb[1] = ud.row_bytes;
         t.nb[2] = t.nb[3] = t.nb[1]*n_rows;
         ggml_set_name(&t, "per_layer_token_embd.weight");
         gguf_add_tensor(ctx, &t);
@@ -1012,12 +1167,15 @@ static int test_engram_layouts(const size_t seed, const ggml_log_level log_level
         }
         const uint32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model.get()));
         logits[i] = get_logits(model.get(), lctx.get(), get_tokens(32, n_vocab, seed));
+        if (i == 1 && table_type == GGML_TYPE_IQ4_NL) {
+            test_engram_file_layout(one_table.get(), *model, ud, logits[i]);
+        }
     }
     llama_log_set(ld.callback, ld.user_data);
 
     const bool ok = logits[0] == logits[1];
-    printf("%s: engram.* vs ple.* (MXFP8 table) layout: %s (nmse %.3g)\n", __func__,
-           ok ? "identical" : "DIFFERENT", nmse(logits[0], logits[1]));
+    printf("%s: engram.* vs ple.* (%s table) layout: %s (nmse %.3g)\n", __func__,
+           ggml_type_name(table_type), ok ? "identical" : "DIFFERENT", nmse(logits[0], logits[1]));
     return ok ? 0 : 1;
 }
 
@@ -1032,10 +1190,15 @@ int main(int argc, char ** argv) {
     std::string out;
     bool kv_grow = false;
     bool engram_layouts = false;
+    bool engram_iq4 = false;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--kv-grow") == 0) {
             kv_grow = true;
+            continue;
+        }
+        if (strcmp(argv[i], "--engram-layouts-iq4") == 0) {
+            engram_layouts = engram_iq4 = true;
             continue;
         }
         if (strcmp(argv[i], "--engram-layouts") == 0) {
@@ -1086,7 +1249,7 @@ int main(int argc, char ** argv) {
             return test_kv_grow(arch, seed, log_level);
         }
         if (engram_layouts) {
-            return test_engram_layouts(seed, log_level);
+            return test_engram_layouts(seed, log_level, engram_iq4 ? GGML_TYPE_IQ4_NL : GGML_TYPE_MXFP8);
         }
         return test_backends(arch, seed, log_level);
     } catch (const std::exception & err) {

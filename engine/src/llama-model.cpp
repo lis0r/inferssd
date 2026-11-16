@@ -6046,12 +6046,23 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                     if (engram_ple_layout) {
                         int64_t n_rows = 0;
                         for (size_t k = 0; k < engram_offsets.size(); ++k) {
+                            if (engram_offsets[k] > uint64_t(INT32_MAX) ||
+                                    engram_primes[k] > uint64_t(INT32_MAX) + 1 - engram_offsets[k]) {
+                                throw std::runtime_error("Engram bucket exceeds the int32 graph-index range");
+                            }
                             n_rows = std::max(n_rows, (int64_t) (engram_offsets[k] + engram_primes[k]));
                         }
-                        if (n_rows > (int64_t) INT32_MAX + 1) {
-                            throw std::runtime_error("Engram rows are outside the int32 graph-index range");
+                        const auto table_name = tn(LLM_TENSOR_PER_LAYER_TOKEN_EMBD, "weight");
+                        if (const auto * weight = ml.get_weight(table_name.str().c_str())) {
+                            if (weight->tensor->ne[1] < n_rows || weight->tensor->ne[1] > int64_t(INT32_MAX) + 1) {
+                                throw std::runtime_error("shared Engram table does not cover its bucket ranges");
+                            }
+                            n_rows = weight->tensor->ne[1]; // allow padded rows without changing the hash
+                            // Register before init_mappings so neither ordinary loading nor
+                            // SSD expert deferral can prefetch, lock or copy the whole table.
+                            ml.mark_ple_lazy(*weight);
                         }
-                        per_layer_tok_embd = create_tensor(tn(LLM_TENSOR_PER_LAYER_TOKEN_EMBD, "weight"),
+                        per_layer_tok_embd = create_tensor(table_name,
                                                            {(int64_t) hparams.engram_key_length, n_rows}, 0);
                     }
 

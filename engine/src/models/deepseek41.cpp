@@ -494,6 +494,12 @@ ggml_tensor * llm_build_deepseek41::build_inp_engram(int il) {
         ggml_backend_sched_set_tensor_backend(sched, emb, backend_cpu);
     } else {
         emb = ggml_get_rows(ctx0, model.layers[il].engram_embd, rows);
+        if (model.engram_ple_layout) {
+            // Keep the file-backed table on CPU; only the gathered rows may be
+            // copied to the device for the Engram projection.
+            ggml_backend_sched_set_tensor_backend(sched, rows, backend_cpu);
+            ggml_backend_sched_set_tensor_backend(sched, emb, backend_cpu);
+        }
     }
     emb = ggml_reshape_2d(ctx0, emb, key_len * n_cols, n_tokens);
     cb(emb, "engram_embd", il);

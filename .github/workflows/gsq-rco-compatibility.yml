@@ -1,0 +1,63 @@
+name: GSQ-RCO compatibility monitoring
+
+on:
+  schedule:
+    - cron: '23 4 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: gsq-rco-compatibility-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  allocation:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - name: Check source availability and allocation against cached evidence
+        run: python3 scripts/inferssd/check-gsq-rco.py --refresh --output evidence/allocation
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: always()
+        with:
+          name: gsq-rco-allocation-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: evidence
+          if-no-files-found: error
+          retention-days: 90
+
+  lookup:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - name: Build offline layout and sparse-residency checks
+        run: |
+          mkdir -p evidence
+          git rev-parse HEAD > evidence/code-commit.txt
+          date -u +%FT%TZ > evidence/observed-at.txt
+          cmake --preset linux-cpu -DGGML_NATIVE=OFF
+          cmake --build build-linux-cpu --parallel 4 --target test-llama-archs test-dsv41-engram
+      - name: Replay synthetic file and lookup checks without provider requests
+        run: |
+          set -o pipefail
+          ctest --test-dir build-linux-cpu --output-on-failure --no-tests=error \
+            --output-junit "$PWD/evidence/tests.xml" \
+            -R '^test-dsv41-engram(-layouts|-iq4-file)?$' | tee evidence/tests.log
+          if grep -E '\bSKIP\b|\*\*\*Not Run|\*\*\*Skipped' evidence/tests.log; then exit 1; fi
+          grep -q '100% tests passed' evidence/tests.log
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: always()
+        with:
+          name: gsq-rco-lookup-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            evidence
+            build-linux-cpu/Testing/Temporary
+          if-no-files-found: error
+          retention-days: 90

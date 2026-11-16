@@ -43,6 +43,8 @@ jobs:
           python3 scripts/test-public-scan.py
           python3 scripts/test-check-pr-title.py
           python3 scripts/test-triage.py
+          python3 scripts/inferssd/test-gsq-rco.py
+          python3 scripts/inferssd/check-gsq-rco.py --output build-gsq-evidence
       - name: Install pinned secret scanner
         run: go install github.com/zricethezav/gitleaks/v8@v8.30.1
       - name: Secret scan

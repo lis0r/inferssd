@@ -16,7 +16,7 @@ GPU for the lane, and `test-kv-cache-grow` and `ssd_cpu_sink_work_reclaim` do no
 The `unit` CTest label contains only model-free tests that require neither a GPU
 nor cgroup setup. Build the targets before running `ctest -L unit`; a missing
 executable, skipped test or zero selected tests is not a passing gate. The CUDA workflow compiles the
-server for `sm_120a` and `sm_121a` on `main` and on pull requests that change the
+server for `sm_86`, `sm_120a` and `sm_121a` on `main` and on pull requests that change the
 engine or build configuration; it does not establish GPU runtime correctness.
 Device runs must record both the selected and actually executed tests.
 
@@ -41,6 +41,36 @@ fetches the model that `test-thread-safety` and `test-state-restore-fragmented` 
 `test-tokenizers-ggml-vocabs` clones vocabularies with Git LFS, `test-quant-type-selection`
 compares its recorded snapshots with the current Hugging Face files, and `test-jinja-py`
 needs `python3` with `jinja2`; exclude them with `ctest -E` where these are unavailable or have changed.
+
+## DeepSeek-V4.1 shared Engram layouts
+
+The `test-dsv41-engram-layouts` gate covers the layout support from PR #286.
+`test-dsv41-engram-iq4-file` also checks the GSQ-RCO IQ4_NL layout: six real
+synthetic GGUF shards, the published `engram_kv` alias, a linked shared table,
+and identical logits before and after file-backed loading. On POSIX the table
+is padded beyond 8 GiB with sparse holes; only the known fixture rows are used.
+Linux checks that at most 32 MiB of table pages are resident before and after
+inference. Other platforms report residency as unavailable (`-1`), not zero.
+The test also rejects `--no-mmap`, `--check-tensors` and `--mlock` for a shared
+table, since those options conflict with keeping it lazily mapped on disk.
+
+The `GSQ-RCO compatibility monitoring` workflow runs weekly and on manual
+dispatch. One independent job makes a single bounded request for the publisher's
+allocation manifest and compares it with the versioned cached evidence in
+`framework/tests/fixtures/gsq-rco`. Another replays the native synthetic lookup
+tests without model downloads. Results retain timestamps, code versions, raw
+allocation evidence, test logs and JUnit outcomes for 90 days. Missing or
+unavailable evidence fails its check; source quality does not affect production
+liveness and no external notification integration is configured.
+
+Local source replay: `python3 scripts/inferssd/check-gsq-rco.py --output build-gsq-evidence`.
+Add `--refresh` to check the current manifest. This certifies allocation/schema
+compatibility only, not CUDA execution or full-checkpoint output quality.
+
+The GSQ-RCO files can be used through `-m /path/to/...-00001-of-00006.gguf`.
+Keep the shared Engram file beside the backbone and link it to the expected
+`...-00006-of-00006.gguf` name, using a symlink or hard link. The current `-hf`
+catalog remains limited to its listed reference checkpoints.
 
 ## Shared expert store
 

@@ -1213,6 +1213,7 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         // overridden: never a repacked, host or device copy.
         uint32_t expert_layer = 0;
         const bool plain_mmap = (get_arch() == LLM_ARCH_QWEN4EXP && tn.tensor == LLM_TENSOR_PER_LAYER_TOKEN_EMBD) ||
+            (get_arch() == LLM_ARCH_DEEPSEEK41 && tn.tensor == LLM_TENSOR_PER_LAYER_TOKEN_EMBD) ||
             (map_deferred_experts && llama_is_expert_tensor_name(tn.str(), expert_layer));
         if (plain_mmap) {
             buft = ggml_backend_cpu_buffer_type();

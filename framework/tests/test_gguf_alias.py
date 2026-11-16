@@ -546,3 +546,52 @@ def test_launch_retains_temporary_staging_and_ordered_atomic_failure_boundary(tm
     # Preserve the existing per-file atomic boundary, including a complete new
     # alias after failure of the second publication; no engine may launch then.
     assert len(list(cache.glob("*.tsv"))) == int(failure == "second-publish")
+
+
+def test_shared_engram_symlink_keeps_numbered_shard_identity(tmp_path):
+    paths = [tmp_path / f"model-{i:05d}-of-00006.gguf" for i in range(1, 7)]
+    shared = tmp_path / "shared" / "Engram-IQ4_NL.gguf"
+    shared.parent.mkdir()
+    fixture(
+        paths[0],
+        tensors=[],
+        payload=0,
+        kv=[("split.no", 2, 0), ("split.count", 2, 6), ("split.tensors.count", 5, 5)],
+    )
+    for index, path in enumerate(paths[1:5], 1):
+        fixture(
+            path,
+            tensors=[(f"blk.{index}.ffn_up_exps.weight", (256, 1, 384), 29, 0)],
+            kv=[("split.no", 2, index)],
+        )
+    fixture(
+        shared,
+        tensors=[("per_layer_token_embd.weight", (256, 32), 20, 0)],
+        kv=[("split.no", 2, 5), ("split.count", 2, 6), ("split.tensors.count", 5, 5)],
+    )
+    paths[-1].symlink_to(shared)
+    rows, summary = m.build_rows(paths, {"up"}, 384)
+    assert len(rows) == 4 * 384
+    assert summary["model_shards"] == 6
+    assert summary["by_type"]["IQ1_M"]["tensors"] == 4
+    # The link is allowed; metadata must still identify its intended slot.
+    fixture(
+        shared,
+        tensors=[("per_layer_token_embd.weight", (256, 32), 20, 0)],
+        kv=[("split.no", 2, 4)],
+    )
+    with pytest.raises(RuntimeError, match="inconsistent split.no"):
+        m.build_rows(paths, {"up"}, 384)
+
+
+@pytest.mark.parametrize("link", ["symlink", "hardlink"])
+def test_numbered_links_cannot_reuse_one_source_file(tmp_path, link):
+    first = tmp_path / "model-00001-of-00002.gguf"
+    second = tmp_path / "model-00002-of-00002.gguf"
+    fixture(first)
+    if link == "symlink":
+        second.symlink_to(first)
+    else:
+        second.hardlink_to(first)
+    with pytest.raises(RuntimeError, match="duplicate GGUF source file"):
+        m.build_rows([first, second], {"up"}, 256)

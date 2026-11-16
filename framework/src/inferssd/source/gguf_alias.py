@@ -329,9 +329,13 @@ def _validate_shards(paths: list[Path]) -> list[int]:
     if not paths:
         raise RuntimeError("no GGUF model files were selected")
     resolved = [path.resolve(strict=True) for path in paths]
-    if len(set(resolved)) != len(resolved):
+    identities = [(path.stat().st_dev, path.stat().st_ino) for path in resolved]
+    if len(set(identities)) != len(identities):
         raise RuntimeError("duplicate GGUF source file")
-    first = SHARD_RE.fullmatch(resolved[0].name)
+    # Numbered shard links can target an unnumbered shared Engram file. Validate
+    # the requested names; use resolved file identities to reject duplicates.
+    named = [path.absolute() for path in paths]
+    first = SHARD_RE.fullmatch(named[0].name)
     if first is None:
         if len(paths) != 1:
             raise RuntimeError("multiple GGUF files must form one complete numbered shard set")
@@ -343,12 +347,12 @@ def _validate_shards(paths: list[Path]) -> list[int]:
     if len(paths) != total:
         raise RuntimeError("GGUF source list is not the complete numbered shard set")
     expected = {
-        resolved[0].parent / f"{prefix}-{i:05d}-of-{total_text}.gguf" for i in range(1, total + 1)
+        named[0].parent / f"{prefix}-{i:05d}-of-{total_text}.gguf" for i in range(1, total + 1)
     }
-    if set(resolved) != expected:
+    if set(named) != expected:
         raise RuntimeError("GGUF source list is not the complete numbered shard set")
     numbers = []
-    for path in resolved:
+    for path in named:
         match = SHARD_RE.fullmatch(path.name)
         if match is None:
             raise RuntimeError("GGUF source list contains an unnumbered shard")
