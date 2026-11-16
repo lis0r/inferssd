@@ -2252,11 +2252,22 @@ void llama_model::load_hparams(llama_model_loader & ml) {
                 hparams.rope_freq_base_train_swa  = hparams.rope_freq_base_train;
                 hparams.rope_freq_scale_train_swa = hparams.rope_freq_scale_train;
 
-                ml.get_arr_n(LLM_KV_ENGRAM_LAYER_IDS, engram_n_layer);
+                // Files lay the Engram out one of two ways: engram.* metadata with a table, q and k per layer,
+                // or (unsloth's GGUFs) ple.* metadata with every layer's table in one per_layer_token_embd,
+                // whose head offsets run on across the layers, and engram_gate = engram_q * engram_k per
+                // layer. The values mean the same either way.
+                engram_ple_layout = !dsv41_antirez_layout && ml.get_arr_n(LLM_KV_PLE_LAYERS, engram_n_layer, false);
+                const llm_kv kv_engram_layers  = engram_ple_layout ? LLM_KV_PLE_LAYERS            : LLM_KV_ENGRAM_LAYER_IDS;
+                const llm_kv kv_engram_mult    = engram_ple_layout ? LLM_KV_PLE_LAYER_MULTIPLIERS : LLM_KV_ENGRAM_MULTIPLIERS;
+                const llm_kv kv_engram_primes  = engram_ple_layout ? LLM_KV_PLE_HEAD_VOCAB_SIZES  : LLM_KV_ENGRAM_PRIMES;
+                const llm_kv kv_engram_offsets = engram_ple_layout ? LLM_KV_PLE_HEAD_OFFSETS      : LLM_KV_ENGRAM_OFFSETS;
+                const llm_kv kv_engram_pad     = engram_ple_layout ? LLM_KV_ENGRAM_PAD_TOKEN_ID   : LLM_KV_ENGRAM_PAD_ID;
+
+                ml.get_arr_n(kv_engram_layers, engram_n_layer);
                 if (engram_n_layer == 0 || engram_n_layer > LLAMA_MAX_LAYERS) {
                     throw std::runtime_error(format("DeepSeek-V4.1 engram layer count %u is out of range", engram_n_layer));
                 }
-                ml.get_arr(LLM_KV_ENGRAM_LAYER_IDS, hparams.engram_layer_ids);
+                ml.get_arr(kv_engram_layers, hparams.engram_layer_ids);
 
                 std::string engram_encoding;
                 if (ml.get_key(LLM_KV_ENGRAM_ENCODING, engram_encoding, false)) {
@@ -2284,12 +2295,16 @@ void llama_model::load_hparams(llama_model_loader & ml) {
                             throw std::runtime_error("Engram row count is outside the int32 graph-index range");
                         }
                     }
+                } else if (engram_ple_layout) {
+                    ml.get_key(LLM_KV_PLE_HEADS_PER_NGRAM,        hparams.engram_n_head);
+                    ml.get_key(LLM_KV_EMBEDDING_LENGTH_PER_LAYER, hparams.engram_key_length);
+                    ml.get_key(LLM_KV_PLE_NGRAM_SIZE,             hparams.engram_max_ngram_size);
                 } else {
                     ml.get_key(LLM_KV_ENGRAM_HEAD_COUNT,     hparams.engram_n_head);
                     ml.get_key(LLM_KV_ENGRAM_KEY_LENGTH,     hparams.engram_key_length);
                     ml.get_key(LLM_KV_ENGRAM_MAX_NGRAM_SIZE, hparams.engram_max_ngram_size);
                 }
-                ml.get_key(LLM_KV_ENGRAM_PAD_ID,         engram_pad_id);
+                ml.get_key(kv_engram_pad, engram_pad_id);
 
                 if (hparams.engram_n_head == 0 || hparams.engram_max_ngram_size < 2) {
                     throw std::runtime_error("DeepSeek-V4.1 engram needs at least one head and a 2-gram");
@@ -2300,7 +2315,7 @@ void llama_model::load_hparams(llama_model_loader & ml) {
                     }
                 }
 
-                ml.get_arr(LLM_KV_ENGRAM_MULTIPLIERS, engram_multipliers);
+                ml.get_arr(kv_engram_mult, engram_multipliers);
                 if (hparams.engram_e4m3_e8m0_32_row264) {
                     // antirez stores these two arrays as U32. Keep the runtime
                     // representation used by the existing DeepSeek-V4.1 graph,
@@ -2318,7 +2333,7 @@ void llama_model::load_hparams(llama_model_loader & ml) {
                         engram_token_map.push_back((int32_t) token);
                     }
                 } else {
-                    ml.get_arr(LLM_KV_ENGRAM_PRIMES,    engram_primes);
+                    ml.get_arr(kv_engram_primes,        engram_primes);
                     ml.get_arr(LLM_KV_ENGRAM_TOKEN_MAP, engram_token_map);
                 }
 
@@ -2363,7 +2378,7 @@ void llama_model::load_hparams(llama_model_loader & ml) {
                         }
                     }
                 } else {
-                    ml.get_arr(LLM_KV_ENGRAM_OFFSETS, engram_offsets);
+                    ml.get_arr(kv_engram_offsets, engram_offsets);
                     if (engram_offsets.size() != engram_primes.size()) {
                         throw std::runtime_error("engram offset count does not match layers * buckets");
                     }
@@ -3590,6 +3605,7 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
     std::vector<llama_model_tensor_buft_override> engram_buft_overrides;
     if (arch == LLM_ARCH_DEEPSEEK41) {
         engram_buft_overrides.push_back({ "blk\\.[0-9]+\\.engram_embd\\.weight", ggml_backend_cpu_buffer_type() });
+        engram_buft_overrides.push_back({ "per_layer_token_embd\\.weight", ggml_backend_cpu_buffer_type() });
         if (ml.tensor_buft_overrides) {
             for (const llama_model_tensor_buft_override * override = ml.tensor_buft_overrides; override->pattern != nullptr; ++override) {
                 engram_buft_overrides.push_back(*override);
@@ -6025,6 +6041,20 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                     output_norm = create_tensor(tn(LLM_TENSOR_OUTPUT_NORM, "weight"), {n_embd}, 0);
                     output      = create_tensor(tn(LLM_TENSOR_OUTPUT,      "weight"), {n_embd, n_vocab}, 0);
 
+                    // the one table every Engram layer reads, where the file keeps them together; a row index is
+                    // a bucket offset plus a hash, so the table ends where the last bucket of the last layer does
+                    if (engram_ple_layout) {
+                        int64_t n_rows = 0;
+                        for (size_t k = 0; k < engram_offsets.size(); ++k) {
+                            n_rows = std::max(n_rows, (int64_t) (engram_offsets[k] + engram_primes[k]));
+                        }
+                        if (n_rows > (int64_t) INT32_MAX + 1) {
+                            throw std::runtime_error("Engram rows are outside the int32 graph-index range");
+                        }
+                        per_layer_tok_embd = create_tensor(tn(LLM_TENSOR_PER_LAYER_TOKEN_EMBD, "weight"),
+                                                           {(int64_t) hparams.engram_key_length, n_rows}, 0);
+                    }
+
                     for (int i = 0; i < n_layer; ++i) {
                         auto & layer = layers[i];
 
@@ -6079,26 +6109,34 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                             const int64_t n_cols  = (int64_t) (hparams.engram_max_ngram_size - 1) * hparams.engram_n_head;
                             const int64_t key_len = hparams.engram_key_length;
 
-                            // a row index is a bucket offset plus a hash and the buckets lie back to back, so the
-                            // table ends where the last bucket does; the e4m3_e8m0_32_row264 row count was checked
-                            // against the same bucket sum when the metadata was read
-                            int64_t n_rows = 0;
-                            for (int64_t b = 0; b < n_cols; ++b) {
-                                const size_t k = (size_t) eg*n_cols + b;
-                                n_rows = std::max(n_rows, (int64_t) (engram_offsets[k] + engram_primes[k]));
-                            }
-                            const int64_t row_width = hparams.engram_e4m3_e8m0_32_row264 ? 264 : key_len;
+                            if (engram_ple_layout) {
+                                layer.engram_embd = per_layer_tok_embd;
+                            } else {
+                                // a row index is a bucket offset plus a hash and the buckets lie back to back, so
+                                // the table ends where the last bucket does; the e4m3_e8m0_32_row264 row count was
+                                // checked against the same bucket sum when the metadata was read
+                                int64_t n_rows = 0;
+                                for (int64_t b = 0; b < n_cols; ++b) {
+                                    const size_t k = (size_t) eg*n_cols + b;
+                                    n_rows = std::max(n_rows, (int64_t) (engram_offsets[k] + engram_primes[k]));
+                                }
+                                const int64_t row_width = hparams.engram_e4m3_e8m0_32_row264 ? 264 : key_len;
 
-                            // hundreds of millions of rows, but each token touches only n_cols of them; the
-                            // table is pinned to a plain CPU buffer (see the override above) so rows page in on demand
-                            layer.engram_embd = create_tensor(tn(LLM_TENSOR_ENGRAM_EMBD, "weight", i), {row_width, n_rows}, 0);
-                            if (hparams.engram_e4m3_e8m0_32_row264 && layer.engram_embd->type != GGML_TYPE_I8) {
-                                throw std::runtime_error(format("%s must be I8 for e4m3_e8m0_32_row264",
-                                                                layer.engram_embd->name));
+                                // hundreds of millions of rows, but each token touches only n_cols of them; the table
+                                // is pinned to a plain CPU buffer (see the override above) so rows page in on demand
+                                layer.engram_embd = create_tensor(tn(LLM_TENSOR_ENGRAM_EMBD, "weight", i), {row_width, n_rows}, 0);
+                                if (hparams.engram_e4m3_e8m0_32_row264 && layer.engram_embd->type != GGML_TYPE_I8) {
+                                    throw std::runtime_error(format("%s must be I8 for e4m3_e8m0_32_row264",
+                                                                    layer.engram_embd->name));
+                                }
                             }
                             layer.engram_wkv  = create_tensor(tn(LLM_TENSOR_ENGRAM_WKV,  "weight", i), {n_cols * key_len, n_embd * (hc_mult + 1)}, 0);
-                            layer.engram_q    = create_tensor(tn(LLM_TENSOR_ENGRAM_Q,    "weight", i), {n_embd, hc_mult}, 0);
-                            layer.engram_k    = create_tensor(tn(LLM_TENSOR_ENGRAM_K,    "weight", i), {n_embd, hc_mult}, 0);
+                            if (engram_ple_layout) {
+                                layer.engram_gate = create_tensor(tn(LLM_TENSOR_ENGRAM_GATE, "weight", i), {n_embd, hc_mult}, 0);
+                            } else {
+                                layer.engram_q    = create_tensor(tn(LLM_TENSOR_ENGRAM_Q,    "weight", i), {n_embd, hc_mult}, 0);
+                                layer.engram_k    = create_tensor(tn(LLM_TENSOR_ENGRAM_K,    "weight", i), {n_embd, hc_mult}, 0);
+                            }
                         }
                     }
 
@@ -8964,6 +9002,9 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
         for (uint32_t eg = 0; eg < engram_n_layer; ++eg) {
             const uint32_t il = hparams.engram_layer_ids[eg];
             ggml_tensor * tensor = layers.at(il).engram_embd;
+            if (eg > 0 && tensor == layers.at(hparams.engram_layer_ids[eg - 1]).engram_embd) {
+                continue; // the layers share one table (engram_ple_layout)
+            }
             if (!tensor || !tensor->data) {
                 ++skipped_non_mmap;
                 continue;
